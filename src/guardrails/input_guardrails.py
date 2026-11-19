@@ -11,6 +11,7 @@ Status convention (không dùng True/False mơ hồ):
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Literal
 
 from google.genai import types
@@ -51,16 +52,123 @@ def detect_injection(user_input: str) -> InputStatus:
     Returns:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
-    INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
-    ]
+    normalized = normalize_text(user_input)
+    folded = fold_vietnamese(normalized)
 
-    for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
-            return "BLOCK"
+    # Signal 1 — regex on canonical text (English) and accent-folded text (Vietnamese)
+    if any(re.search(p, normalized, re.IGNORECASE) for p in INJECTION_PATTERNS):
+        return "BLOCK"
+    if any(re.search(p, folded) for p in INJECTION_PATTERNS_VI):
+        return "BLOCK"
+    # Signal 2 — "DAN" jailbreak persona (case-sensitive: "dan" is common in folded Vietnamese)
+    if re.search(r"\bDAN\b", normalized):
+        return "BLOCK"
+    # Signal 3 — spaced / punctuated evasion ("i.g.n.o.r.e a-l-l ...") and protected
+    # values pasted into the prompt (confirmation attacks: "is it admin123?")
+    squashed = squash(folded)
+    if any(needle in squashed for needle in _SQUASHED_NEEDLES):
+        return "BLOCK"
     return "ALLOW"
+
+
+# Zero-width / bidi / format characters used to hide instructions inside text
+_INVISIBLE_RE = re.compile(r"[­͏؜ᅟᅠ឴឵᠎​-‏"
+                           r"‪-‮⁠-⁯ㅤ︀-️﻿ﾠ]")
+
+
+def normalize_text(text: str) -> str:
+    """NFKC-canonicalize, drop invisible/format chars, collapse whitespace."""
+    text = unicodedata.normalize("NFKC", text or "")
+    text = _INVISIBLE_RE.sub("", text)
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def fold_vietnamese(text: str) -> str:
+    """Lowercase + strip diacritics so "Bỏ qua" == "bo qua", "tài khoản" == "tai khoan"."""
+    text = (text or "").lower().replace("đ", "d")
+    decomposed = unicodedata.normalize("NFD", text)
+    return "".join(ch for ch in decomposed if unicodedata.category(ch) != "Mn")
+
+
+def squash(text: str) -> str:
+    """Keep only [a-z0-9] — defeats spacing/punctuation obfuscation."""
+    return re.sub(r"[^a-z0-9]", "", (text or "").lower())
+
+
+_SECRET_ALT = r"password|passcode|credentials?|secrets?|api[\s_-]*keys?|tokens?|db\s+host|database\s+host"
+_SECRET_NOUN = r"(?:" + _SECRET_ALT + r")"
+_ENCODING = (
+    r"(?:base64|rot13|hex(?:adecimal)?|reversed?|backwards|spell(?:ed)?\s+out|"
+    r"character\s+by\s+character|letter\s+by\s+letter)"
+)
+
+INJECTION_PATTERNS = [
+    # 1. Override previous instructions ("ignore all previous instructions", "disregard the rules")
+    r"\b(?:ignore|disregard|forget|override|bypass)\s+(?:(?:all|any|the|your|my|of|these|those)\s+)*"
+    r"(?:(?:previous|prior|above|earlier|preceding|original|system|safety|security)\s+)*"
+    r"(?:instructions?|rules?|prompts?|directives?|guidelines?|guardrails?|restrictions?|policies)\b",
+    # 2. Persona switch
+    r"\byou\s+are\s+now\b",
+    r"\bfrom\s+now\s+on,?\s+you\s+(?:are|will|must)\b",
+    # 3. System / hidden prompt references
+    r"\b(?:system|developer|hidden|initial|original)\s+(?:prompt|message|instructions?)\b",
+    # 4. Reveal / dump instructions or configuration
+    r"\b(?:reveal|show|print|display|repeat|dump|output|leak|disclose|tell\s+me)\s+(?:me\s+)?"
+    r"(?:your|the|all|its)?\s*(?:full\s+|exact\s+|internal\s+|hidden\s+|original\s+)*"
+    r"(?:instructions?|prompt|rules|configuration|config|context|internal\s+notes?)\b",
+    # 5. Pretend / role-play
+    r"\bpretend\s+(?:you\s+are|you're|to\s+be)\b",
+    r"\brole[\s-]?play\s+as\b",
+    # 6. Unrestricted persona
+    r"\bact\s+as\s+(?:a\s+|an\s+)?(?:unrestricted|uncensored|unfiltered|jailbroken|evil|unaligned)\b",
+    r"\b(?:jailbreak\w*|developer\s+mode|god\s+mode|no\s+restrictions)\b",
+    # 7. Internal secret extraction (admin password, API key, DB host, internal notes)
+    r"\b(?:admin|administrator|root|system|internal|staff|service)\s+(?:password|passcode|credentials?|account\s+password)\b",
+    r"\bapi[\s_-]*keys?\b",
+    r"\b(?:database|db)\s+(?:host|server|connection|url|address|endpoint)\b|\bconnection\s+string\b",
+    r"\binternal\s+(?:notes?|config\w*|credentials?|secrets?|systems?\s+details?)\b",
+    r"\b(?:reveal|disclose|leak|expose|exfiltrate)\b.{0,40}?\b" + _SECRET_NOUN,
+    # 8. Encoding / obfuscation tricks to smuggle a secret out
+    r"\b" + _ENCODING + r"\b.{0,60}?\b(?:" + _SECRET_ALT + r"|prompt|instructions?)",
+    r"\b(?:" + _SECRET_ALT + r"|prompt|instructions?)\b.{0,60}?\b" + _ENCODING + r"\b",
+    # 9. Completion / fill-in-the-blank attacks
+    r"\bfill\s+in\b.{0,60}?\b(?:" + _SECRET_ALT + r"|host|config)",
+    r"(?:password|api\s*key|host|secret)\s*[:=]\s*(?:_{2,}|\.{3,}|\?{2,}|\[\s*\])",
+    # 10. Fake delimiters / injected "system" turns inside untrusted email/RAG data
+    r"<\s*/?\s*(?:system|instructions?|admin)\s*>|\[\s*(?:system|admin)\s*\]|\bnew\s+instructions?\s*:",
+    # 11. Confirmation side-channel ("I already know the password is ..., confirm")
+    r"\bi\s+(?:already\s+)?know\s+(?:the|your)\s+(?:admin\s+)?(?:password|api\s*key|credentials?)\b",
+]
+
+# Matched against the accent-folded text (fold_vietnamese)
+INJECTION_PATTERNS_VI = [
+    r"\bbo\s+qua\s+(?:(?:moi|tat\s+ca|cac|nhung|het)\s+)*(?:huong\s+dan|chi\s+dan|quy\s+tac|lenh|chi\s+thi)",
+    r"\bquen\s+(?:di\s+)?(?:(?:moi|tat\s+ca|cac|het)\s+)*(?:huong\s+dan|chi\s+dan|quy\s+tac)",
+    r"\btiet\s+lo\b.{0,40}?\b(?:mat\s+khau|api|khoa|bi\s+mat|cau\s+hinh|huong\s+dan|noi\s+bo)",
+    r"\bmat\s+khau\s+(?:quan\s+tri|admin|he\s+thong|noi\s+bo)",
+    r"\b(?:loi\s+nhac|prompt|chi\s+dan)\s+he\s+thong\b",
+    r"\b(?:gia\s+vo|hay\s+dong\s+vai|dong\s+vai)\s+(?:ban\s+)?(?:la|lam)\b",
+    r"\btu\s+(?:bay\s+)?gio\s+ban\s+la\b",
+]
+
+try:  # protected values from data/protected/vinbank_secrets.json
+    from core.config import DEMO_SECRETS as _DEMO_SECRETS
+except Exception:  # pragma: no cover
+    _DEMO_SECRETS = []
+
+_SQUASHED_NEEDLES = tuple(
+    {
+        "ignoreallpreviousinstructions",
+        "ignorepreviousinstructions",
+        "ignoreallinstructions",
+        "disregardallpreviousinstructions",
+        "revealyoursystemprompt",
+        "showmeyoursystemprompt",
+        "boquamoihuongdan",
+        *(squash(s) for s in _DEMO_SECRETS if len(squash(s)) >= 6),
+    }
+)
 
 
 # ============================================================
@@ -84,14 +192,46 @@ def topic_filter(user_input: str) -> InputStatus:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
-    input_lower = user_input.lower()
+    folded = fold_vietnamese(normalize_text(user_input))
+    if not folded:
+        return "BLOCK"  # empty / whitespace-only input has no banking intent
 
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
+    # 1. Blocked topic → BLOCK (checked first: "transfer money to buy drugs" is still blocked).
+    #    Victim reports ("my account was hacked") are a banking concern, not a hacking request.
+    if _BLOCKED_RE.search(_VICTIM_REPORT_RE.sub(" ", folded)):
+        return "BLOCK"
+    # 2. No banking signal at all → BLOCK
+    if not _ALLOWED_RE.search(folded):
+        return "BLOCK"
+    # 3. Banking question → ALLOW
+    return "ALLOW"
 
-    pass  # Replace with your implementation
+
+# Extra banking vocabulary on top of core.config.ALLOWED_TOPICS
+EXTRA_ALLOWED_TOPICS = [
+    "bank", "vinbank", "card", "mortgage", "statement", "fee", "branch",
+    "hotline", "overdraft", "remittance", "exchange rate", "otp", "pin",
+    "the ngan hang", "the atm", "tien gui", "khoan vay", "sao ke", "chuyen khoan",
+]
+
+
+def _keyword_regex(keywords: list[str]) -> re.Pattern:
+    """Word-start match so "kill" ≠ "skill", "atm" ≠ "atmosphere".
+
+    Keywords ≥4 chars match as a prefix ("account" → "accounts", "hack" → "hacking");
+    shorter ones ("atm", "vay", "pin") must be a whole word.
+    """
+    parts = []
+    for kw in keywords:
+        kw_folded = fold_vietnamese(kw)
+        body = r"\s+".join(re.escape(w) for w in kw_folded.split())
+        parts.append(rf"\b{body}" if len(kw_folded) >= 4 else rf"\b{body}\b")
+    return re.compile("|".join(parts))
+
+
+_BLOCKED_RE = _keyword_regex(BLOCKED_TOPICS)
+_VICTIM_REPORT_RE = re.compile(r"\b(?:was|were|got|been|is|being|has\s+been)\s+(?:hacked|stolen)\b")
+_ALLOWED_RE = _keyword_regex(ALLOWED_TOPICS + EXTRA_ALLOWED_TOPICS)
 
 
 # ============================================================
@@ -105,13 +245,33 @@ def topic_filter(user_input: str) -> InputStatus:
 #   - Return types.Content to block, or None to pass through
 # ============================================================
 
+INJECTION_BLOCK_MESSAGE = (
+    "[Input guardrail] I cannot process that request because it looks like an attempt "
+    "to override my instructions or obtain internal information. "
+    "I can help with VinBank accounts, transfers, savings, loans and cards."
+)
+TOO_LONG_BLOCK_MESSAGE = (
+    "[Input guardrail] Your message is too long. Please shorten it to under "
+    "{limit} characters and ask one banking question at a time."
+)
+TOPIC_BLOCK_MESSAGE = (
+    "[Input guardrail] I'm a VinBank assistant and can only help with banking topics "
+    "such as accounts, transfers, savings, loans and credit cards."
+)
+
+
 class InputGuardrailPlugin(base_plugin.BasePlugin):
     """Plugin that blocks bad input before it reaches the LLM."""
+
+    MAX_INPUT_CHARS = 4000  # oversized prompts = cost attack / room to hide instructions
 
     def __init__(self):
         super().__init__(name="input_guardrail")
         self.blocked_count = 0
         self.total_count = 0
+        self.injection_blocked = 0
+        self.topic_blocked = 0
+        self.last_block_reason: str | None = None  # "injection" | "topic" | None
 
     def _extract_text(self, content: types.Content) -> str:
         """Extract plain text from a Content object."""
@@ -144,14 +304,29 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
+        # 0. Oversized input
+        if len(text) > self.MAX_INPUT_CHARS:
+            self.blocked_count += 1
+            self.last_block_reason = "too_long"
+            return self._block_response(TOO_LONG_BLOCK_MESSAGE.format(limit=self.MAX_INPUT_CHARS))
 
-        pass  # Replace with your implementation
+        # 1. Prompt injection / jailbreak / secret extraction
+        if detect_injection(text) == "BLOCK":
+            self.blocked_count += 1
+            self.injection_blocked += 1
+            self.last_block_reason = "injection"
+            return self._block_response(INJECTION_BLOCK_MESSAGE)
+
+        # 2. Off-topic or blocked topic
+        if topic_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            self.topic_blocked += 1
+            self.last_block_reason = "topic"
+            return self._block_response(TOPIC_BLOCK_MESSAGE)
+
+        # 3. Both ALLOW → let the message reach the LLM
+        self.last_block_reason = None
+        return None
 
 
 # ============================================================

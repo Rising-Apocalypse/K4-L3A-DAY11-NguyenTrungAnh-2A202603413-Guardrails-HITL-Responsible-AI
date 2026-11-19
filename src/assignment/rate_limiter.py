@@ -23,6 +23,7 @@ class RateLimitPlugin(base_plugin.BasePlugin):
         self.user_windows: dict[str, deque] = defaultdict(deque)
         self.blocked_count = 0
         self.total_count = 0
+        self.last_blocked = False  # did the most recent request hit the limit?
 
     def _block_response(self, message: str) -> types.Content:
         return types.Content(
@@ -37,13 +38,29 @@ class RateLimitPlugin(base_plugin.BasePlugin):
         now = time.time()
         window = self.user_windows[user_id]
 
-        # TODO: Implement sliding window:
-        # 1. Pop timestamps older than (now - window_seconds) from the left
-        # 2. If len(window) >= max_requests:
-        #       wait = window_seconds - (now - window[0])
-        #       self.blocked_count += 1
-        #       return self._block_response(
-        #           f"Rate limit exceeded. Try again in {wait:.0f}s."
-        #       )
-        # 3. Else: append now, return None
-        raise NotImplementedError("Implement RateLimitPlugin.on_user_message_callback")
+        # 1. Slide the window: forget requests older than window_seconds
+        while window and window[0] <= now - self.window_seconds:
+            window.popleft()
+
+        # 2. Over the limit → block without calling the LLM.
+        #    Blocked requests are NOT recorded, so a flooding user is not locked out forever.
+        if len(window) >= self.max_requests:
+            wait = self.window_seconds - (now - window[0])
+            self.blocked_count += 1
+            self.last_blocked = True
+            return self._block_response(
+                f"Rate limit exceeded: max {self.max_requests} requests per "
+                f"{self.window_seconds}s. Try again in {max(wait, 0):.0f}s."
+            )
+
+        # 3. Under the limit → record and let it through
+        window.append(now)
+        self.last_blocked = False
+        return None
+
+    def reset(self):
+        """Clear all windows and counters (used between test groups)."""
+        self.user_windows.clear()
+        self.blocked_count = 0
+        self.total_count = 0
+        self.last_blocked = False

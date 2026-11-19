@@ -1,5 +1,33 @@
 # Day 11 — Controlled Agent Security (2026)
 
+## Bài nộp
+
+| | |
+|---|---|
+| Họ tên | Nguyễn Trung Anh |
+| MSSV | 2A202603413 |
+| Lớp | K4 · L3A · Day 11 |
+| Blue | OpenRouter `liquid/lfm-3-1.7b:free` |
+| Red / Red Advance | OpenAI `gpt-4o-mini` |
+
+**Đã làm:** CP2 `src/guardrails/` (input + output guardrails) · CP3 `src/assignment/` (rate limit, audit, monitoring, egress, suite) · CP4 `src/attacks/attacks.py` (5 prompt tấn công).
+
+**Kết quả** (sinh bằng lệnh, xem `outputs/`):
+
+- `results.json`: safe bị chặn 0/6 · attack bị chặn 10/10 · edge case đúng kỳ vọng 7/7 · rate limit 10 qua / 5 chặn (trên 15 request)
+- `attack_results.json`: Red leak 5/5 · Red Advance leak 0/5 (chặn ở NeMo self-check input và regex L1)
+
+**Chạy lại** (từ gốc repo, sau khi tạo `.venv` và điền `.env`):
+
+```bash
+python src/main.py --part 2   # guardrails (in terminal)
+python src/main.py --part 3   # → outputs/results.json, audit_log.json, metrics.json
+python src/main.py --part 4   # → outputs/*attack*.json (ghi đè!)
+python scripts/grade.py --submission-dir . --out outputs/grade_report.json
+```
+
+---
+
 > 👤 **Hình thức:** bài tập **cá nhân** (1 người / 1 MSSV).  
 > 🎯 **Mục tiêu:** đóng vai **Blue Team** để học cách xây Guardrails phòng thủ, rồi đóng vai **Red Team** để tấn công agent **Red** hoặc **Red Advance**.  
 > ✅ Làm theo **Checkpoint 1 → 5** trong [`CHECKPOINTS.md`](CHECKPOINTS.md) · nộp theo [`SUBMISSION.md`](SUBMISSION.md).
